@@ -1,0 +1,133 @@
+So what does this mean?
+Frontend is using WebSocket only for receiving messages in real-time.
+Frontend is using REST API for sending messages.
+That’s why your backend needs:
+@PostMapping("/send") (for sending) ✅
+@MessageMapping("/chat.sendMessage") (currently unused unless you add stompClient.send in frontend).
+
+1. Q: What challenges did you face while mapping entities to DTOs, and how did you resolve them?
+
+A: Initially, I was directly returning JPA entities from the API. This risked exposing internal fieldsand creating serialization
+ issues with lazy-loaded relationships. To tackle this, I created dedicated DTO classes like UserDTO and MessageDTO and added 
+ fromEntity methods. This ensured only the required fields were exposed in responses,  keeping the API secure and consistent.
+
+2. Q: How did you handle the issue of leaking entity objects in your API responses?
+
+A: Instead of returning entities like User or ChatMessage, I refactored the code so all responses went through DTO builders
+ (UserDTO.fromEntity(user), MessageDTO.fromEntity(message)). This prevented sensitive fields from leaking and followed 
+a clean separation between persistence and API layers.   
+
+Q1. How would you implement real-time online user tracking in a chat application?
+
+Answer:
+I would use WebSockets with STOMP over SockJS. On the backend (Spring Boot), I maintain an in-memory ConcurrentHashMap that tracks
+ active connections for each user. When a user connects or disconnects, event listeners (SessionConnectEvent and SessionDisconnectEvent) 
+ update the map. After each update, I broadcast the list of currently online users to all clients using 
+ simpMessagingTemplate.convertAndSend("/topic/online-users", ...).On the frontend (React), I use a STOMP client (@stomp/stompjs)
+that subscribes to /topic/online-users. Whenever a message arrives, the store (useChatStore) updates the onlineUsers list. This way,
+user presence updates are reflected instantly across all sessions without requiring a page refresh.
+
+Q2. How do you ensure that WebSocket connections are authenticated?
+
+Answer:
+I intercept the CONNECT command in the WebSocket configuration (ChannelInterceptor). The client passes the JWT token in the WebSocket 
+connect headers. I extract the token, validate it, and then set the Principal (usually the user’s email) into the StompHeaderAccessor.
+ This makes the user identity available throughout the WebSocket lifecycle, including in onConnect and onDisconnect events. It also 
+ ensures that only authenticated users can maintain WebSocket sessions.
+
+Q3. What problem occurs if you only broadcast online users from the backend without handling disconnect events properly?
+
+Answer:
+If disconnect events aren’t handled, a user may appear permanently online even after closing their browser or logging out. This happens
+because the system never decrements their connection count. To solve this, I implemented a connection counter per user. Each new session
+increments the count, and each disconnect decrements it. A user is only removed from the online list when their connection count
+reaches zero. This prevents false “online” states.
+
+Q4. How would you design the frontend to display online/offline status in real-time?
+
+Answer:
+In the frontend, I maintain two lists in state management (useChatStore):
+
+All users – fetched from the REST API.
+
+Online users – updated in real time from WebSocket events.
+
+In the Sidebar component, I merge these lists: each user gets a green dot if they’re present in the online list. There’s also a toggle 
+(showOnlineOnly) that filters the sidebar to only show currently online users. This setup ensures the UI reflects online/offline states 
+instantly, without requiring manual refresh.
+
+Q5. How would you make sure the WebSocket reconnects automatically after login or token refresh?
+
+Answer:
+I integrate the WebSocket connection logic into the authentication store (useAuthStore). After a successful login, the store triggers 
+connectSocket() with the new token. I also handle token expiration by intercepting failures and refreshing the token before reconnecting.
+ This ensures the WebSocket always stays alive with a valid token, and online presence updates continue to work seamlessly.
+
+ How does your application differentiate between users when broadcasting presence updates?
+👉 Talk about using Principal.getName() (email) as the unique identifier in STOMP/WebSocket and mapping it to your User entity.
+
+Why do you use ScheduledExecutorService with a delay on disconnect instead of immediately marking the user offline?
+👉 Answer: to handle browser refreshes, network jitter, and quick reconnects without showing flickering presence.
+
+What problem would occur if you didn’t use ConcurrentHashMap for userConnectionCounts?
+👉 Answer: multiple threads handle connect/disconnect, so race conditions could lead to inconsistent online counts.
+
+What’s the difference between broadcasting /topic/online-users vs sending to a specific user with /queue/online-users-init?
+👉 Answer: /topic is for all subscribers (global updates), /queue is for one specific session to send the initial state.
+
+How would you handle the scenario where a user closes the browser without sending a proper disconnect event?
+👉 Answer: Use heartbeat timeouts (STOMP/WebSocket ping-pong), or track last-seen timestamp and auto-expire connections.
+
+🔹 Backend Logic
+
+Why do you store connection counts instead of a simple online/offline flag?
+👉 Answer: because users may connect from multiple tabs or devices, so only when all sessions close should they be considered offline.
+
+If two users are chatting, how do you ensure messages are delivered in real time to both sender and receiver?
+👉 Answer: use SimpMessagingTemplate.convertAndSendToUser() for both sender and receiver destinations.
+
+How does your JwtProvider integrate with WebSocket connections to authenticate users?
+👉 (If asked, explain handshake interceptor to extract JWT during WebSocket handshake and set Principal.)
+
+🔹 Frontend React
+
+In your Sidebar, how do you determine whether a user is online or offline?
+👉 Answer: compare all users against onlineUsers list from WebSocket. If id exists in that list → show green dot.
+
+Why did you add a “Show online only” toggle in the sidebar, and how does it filter data efficiently?
+👉 Answer: It improves UX for busy contact lists, and I use useMemo to avoid recalculating filters on every render.
+
+What is a heartbeat in WebSocket/STOMP?
+A heartbeat is a small "ping" frame (basically just a line break) exchanged between the client and the server at regular intervals.
+It prevents idle connections from being closed by proxies/firewalls.
+It allows detection if the client or server has silently crashed/disconnected.
+🔹 Format in STOMP: heart-beat=[client-send, client-receive]
+The first number (10000) → how often (in ms) the client promises to send a heartbeat to the server.
+The second number (10000) → how often (in ms) the client can accept heartbeats from the server.
+So in your case:
+
+Client → Server: "I will send a heartbeat every 10 seconds (10000 ms)."
+Server → Client: "I can receive heartbeats every 10 seconds too."
+
+🔹 Example Flow
+
+Client connects with header: heart-beat=10000,10000.
+Server responds with its own heartbeat config.
+Effective heartbeat interval = max(client, server values) (to avoid overload).
+e.g., if client = 10000 and server = 5000 → actual heartbeat = 10000 ms.
+If no heartbeat or message is received in that time + grace period, the connection is considered dead and closed.
+
+🔹 Why is it useful in your chat app?
+
+If a user closes their laptop or loses internet, the server won’t receive heartbeats.
+After a short delay, the server detects this and removes the user from the online presence map.
+This keeps your online/offline status accurate.
+
+✅ In short:
+Your "heart-beat=[10000,10000]" means a ping every 10 seconds in both directions to keep the WebSocket alive and detect disconnects.
+
+How Spring Boot negotiates this
+
+Spring uses DefaultStompSession (on the client) and WebSocketStompClient or SimpMessagingTemplate (on the server).
+When you configure a WebSocket endpoint in Spring Boot, you can set heartbeat intervals.
+Spring maintains a TaskScheduler (usually a ThreadPoolTaskScheduler) that runs heartbeat checks and sends them on schedule.

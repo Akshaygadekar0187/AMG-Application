@@ -1,0 +1,457 @@
+// =========================
+// @Configuration for Async + Broker tuning
+// =========================
+package com.example.chat.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
+import org.springframework.scheduling.annotation.EnableAsync;
+
+import java.util.concurrent.Executor;
+
+@Configuration
+@EnableAsync
+public class AsyncAndBrokerConfig {
+
+    @Bean
+    public ThreadPoolTaskScheduler brokerTaskScheduler() {
+        ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+        scheduler.setPoolSize(4);               // tune per load
+        scheduler.setThreadNamePrefix("ws-broker-");
+        scheduler.initialize();
+        return scheduler;
+    }
+
+    @Bean(name = "wsAsyncExecutor")
+    public Executor wsAsyncExecutor() {
+        ThreadPoolTaskExecutor exec = new ThreadPoolTaskExecutor();
+        exec.setCorePoolSize(4);
+        exec.setMaxPoolSize(16);
+        exec.setQueueCapacity(500);
+        exec.setThreadNamePrefix("ws-async-");
+        exec.initialize();
+        return exec;
+    }
+}
+
+// =========================
+// WebSocketConfig – multi-threaded broker + transport tuning
+// =========================
+package com.example.chat.config;
+
+import org.springframework.context.annotation.Configuration;
+import org.springframework.messaging.simp.config.ChannelRegistration;
+import org.springframework.messaging.simp.config.MessageBrokerRegistry;
+import org.springframework.web.socket.config.annotation.EnableWebSocketMessageBroker;
+import org.springframework.web.socket.config.annotation.StompEndpointRegistry;
+import org.springframework.web.socket.config.annotation.WebSocketMessageBrokerConfigurer;
+
+import com.example.chat.ws.HttpHandshakeInterceptor;
+import com.example.chat.ws.JwtChannelInterceptor;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.socket.config.annotation.WebSocketTransportRegistration;
+
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+
+    private final HttpHandshakeInterceptor httpHandshakeInterceptor;
+    private final JwtChannelInterceptor jwtChannelInterceptor;
+    private final AsyncAndBrokerConfig asyncConfig;
+
+    @Autowired
+    public WebSocketConfig(HttpHandshakeInterceptor httpHandshakeInterceptor,
+                           JwtChannelInterceptor jwtChannelInterceptor,
+                           AsyncAndBrokerConfig asyncConfig) {
+        this.httpHandshakeInterceptor = httpHandshakeInterceptor;
+        this.jwtChannelInterceptor = jwtChannelInterceptor;
+        this.asyncConfig = asyncConfig;
+    }
+
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry config) {
+        config.enableSimpleBroker("/topic", "/queue")
+              .setTaskScheduler(asyncConfig.brokerTaskScheduler())
+              .setHeartbeatValue(new long[]{10000, 20000}); // server->client, client->server
+        config.setApplicationDestinationPrefixes("/app");
+        config.setUserDestinationPrefix("/user");
+    }
+
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        registry.addEndpoint("/ws")
+                .addInterceptors(httpHandshakeInterceptor)
+                .setAllowedOriginPatterns("http://localhost:5173")
+                .withSockJS()
+                .setSessionCookieNeeded(false);
+    }
+
+    @Override
+    public void configureClientInboundChannel(ChannelRegistration registration) {
+        registration.interceptors(jwtChannelInterceptor);
+    }
+
+    @Override
+    public void configureWebSocketTransport(WebSocketTransportRegistration registration) {
+        registration.setMessageSizeLimit(256 * 1024)   // 256 KB
+                    .setSendBufferSizeLimit(512 * 1024)
+                    .setSendTimeLimit(20 * 1000);
+    }
+}
+
+// =========================
+// HttpHandshakeInterceptor – keep minimal (no DB or heavy work here)
+// =========================
+package com.example.chat.ws;
+
+import org.springframework.stereotype.Component;
+import org.springframework.web.socket.server.HandshakeInterceptor;
+import org.springframework.http.server.ServerHttpRequest;
+import org.springframework.http.server.ServerHttpResponse;
+import org.springframework.web.socket.WebSocketHandler;
+
+import java.util.Map;
+
+@Component
+public class HttpHandshakeInterceptor implements HandshakeInterceptor {
+    @Override
+    public boolean beforeHandshake(ServerHttpRequest request, ServerHttpResponse response,
+                                   WebSocketHandler wsHandler, Map<String, Object> attributes) {
+        // Keep lightweight. You could attach client IP if needed.
+        return true;
+    }
+
+    @Override
+    public void afterHandshake(ServerHttpRequest request, ServerHttpResponse response,
+                               WebSocketHandler wsHandler, Exception exception) { }
+}
+
+// =========================
+// JwtChannelInterceptor – resolve User once, store lightweight attributes
+// =========================
+package com.example.chat.ws;
+
+import com.example.chat.security.JwtProvider;
+import com.example.chat.user.User;
+import com.example.chat.user.UserRepository;
+import com.example.chat.ws.presence.OnlinePresenceService;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.messaging.Message;
+import org.springframework.messaging.MessageChannel;
+import org.springframework.messaging.simp.stomp.StompCommand;
+import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
+import org.springframework.messaging.support.ChannelInterceptor;
+import org.springframework.stereotype.Component;
+
+import java.util.Map;
+
+@Component
+public class JwtChannelInterceptor implements ChannelInterceptor {
+
+    private final JwtProvider jwtProvider;
+    private final UserRepository userRepo;
+    private final OnlinePresenceService presenceService;
+
+    public JwtChannelInterceptor(JwtProvider jwtProvider,
+                                 UserRepository userRepo,
+                                 @Lazy OnlinePresenceService presenceService) {
+        this.jwtProvider = jwtProvider;
+        this.userRepo = userRepo;
+        this.presenceService = presenceService;
+    }
+
+    @Override
+    public Message<?> preSend(Message<?> message, MessageChannel channel) {
+        StompHeaderAccessor accessor = StompHeaderAccessor.wrap(message);
+        if (accessor == null) return message;
+
+        if (StompCommand.CONNECT.equals(accessor.getCommand())) {
+            String authHeader = accessor.getFirstNativeHeader("Authorization");
+            if (authHeader == null) authHeader = accessor.getFirstNativeHeader("token");
+
+            if (authHeader != null) {
+                String token = authHeader.startsWith("Bearer ") ? authHeader.substring(7) : authHeader;
+                if (jwtProvider.validateToken(token)) {
+                    String email = jwtProvider.getEmailFromToken(token);
+                    userRepo.findByEmail(email).ifPresent(user -> {
+                        accessor.setUser(() -> email); // Principal name = email
+                        Map<String, Object> attrs = accessor.getSessionAttributes();
+                        if (attrs != null) {
+                            attrs.put("userId", user.getId());
+                            attrs.put("email", user.getEmail());
+                            attrs.put("fullName", user.getFullName());
+                            attrs.put("profilePic", user.getProfilePic());
+                        }
+                        presenceService.onConnect(user.getId(), user.getFullName(), user.getEmail(), user.getProfilePic());
+                    });
+                }
+            }
+        } else if (StompCommand.DISCONNECT.equals(accessor.getCommand())) {
+            Long userId = null;
+            Map<String, Object> attrs = accessor.getSessionAttributes();
+            if (attrs != null && attrs.get("userId") instanceof Long id) {
+                userId = id;
+            }
+            if (userId != null) {
+                presenceService.onDisconnect(userId);
+            }
+        }
+        return message;
+    }
+}
+
+// =========================
+// DTO
+// =========================
+package com.example.chat.ws.presence;
+
+public record UserDTO(Long id, String fullName, String email, String profilePic) {}
+
+// =========================
+// OnlinePresenceService – no DB hits during connect/disconnect/broadcast
+// =========================
+package com.example.chat.ws.presence;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.messaging.simp.SimpMessageHeaderAccessor;
+import org.springframework.messaging.simp.SimpMessageType;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+
+import java.security.Principal;
+import java.util.*;
+import java.util.concurrent.*;
+
+@Service
+public class OnlinePresenceService {
+
+    private static final Logger log = LoggerFactory.getLogger(OnlinePresenceService.class);
+
+    // userId -> connectionCount
+    private final ConcurrentHashMap<Long, Integer> connectionCounts = new ConcurrentHashMap<>();
+    // userId -> cached DTO (no DB dependency)
+    private final ConcurrentHashMap<Long, UserDTO> userCache = new ConcurrentHashMap<>();
+
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+    private final SimpMessagingTemplate messagingTemplate;
+
+    public OnlinePresenceService(SimpMessagingTemplate messagingTemplate) {
+        this.messagingTemplate = messagingTemplate;
+    }
+
+    /** Called once on successful CONNECT after JWT verification */
+    public void onConnect(Long userId, String fullName, String email, String profilePic) {
+        userCache.putIfAbsent(userId, new UserDTO(userId, fullName, email, profilePic));
+        connectionCounts.merge(userId, 1, Integer::sum);
+        log.debug("User connected: {} ({} connections)", fullName, connectionCounts.get(userId));
+        broadcastOnlineUsers();
+    }
+
+    /** Called on DISCONNECT with a small delay to handle tab refreshes */
+    public void onDisconnect(Long userId) {
+        scheduler.schedule(() -> {
+            connectionCounts.computeIfPresent(userId, (id, cnt) -> {
+                int next = cnt - 1;
+                return next > 0 ? next : null; // remove if drops to 0
+            });
+            if (!connectionCounts.containsKey(userId)) {
+                // Optionally keep userCache entry for faster re-logins; or remove to free memory
+                // userCache.remove(userId);
+            }
+            broadcastOnlineUsers();
+        }, 2, TimeUnit.SECONDS);
+    }
+
+    /** Send initial list to a new subscriber's session without hitting DB */
+    public void sendInitialListToSession(Principal principal, String sessionId) {
+        if (principal == null) return;
+        List<UserDTO> online = getOnlineUsers();
+        SimpMessageHeaderAccessor headers = SimpMessageHeaderAccessor.create(SimpMessageType.MESSAGE);
+        headers.setSessionId(sessionId);
+        headers.setLeaveMutable(true);
+        messagingTemplate.convertAndSendToUser(principal.getName(), "/queue/online-users-init", online, headers.getMessageHeaders());
+    }
+
+    @Async("wsAsyncExecutor")
+    public void broadcastOnlineUsers() {
+        List<UserDTO> online = getOnlineUsers();
+        messagingTemplate.convertAndSend("/topic/online-users", online);
+    }
+
+    public List<UserDTO> getOnlineUsers() {
+        // build from cache filtered by who has connectionCount > 0
+        List<UserDTO> list = new ArrayList<>();
+        for (Map.Entry<Long, Integer> e : connectionCounts.entrySet()) {
+            if (e.getValue() != null && e.getValue() > 0) {
+                UserDTO dto = userCache.get(e.getKey());
+                if (dto != null) list.add(dto);
+            }
+        }
+        return list;
+    }
+
+    public Set<Long> getOnlineUserIds() {
+        return connectionCounts.keySet();
+    }
+}
+
+// =========================
+// WebSocketEventListener – initial list on subscribe
+// =========================
+package com.example.chat.ws;
+
+import com.example.chat.ws.presence.OnlinePresenceService;
+import org.springframework.context.event.EventListener;
+import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
+import org.springframework.stereotype.Component;
+import org.springframework.web.socket.messaging.SessionSubscribeEvent;
+
+@Component
+public class WebSocketEventListener {
+
+    private final OnlinePresenceService presenceService;
+
+    public WebSocketEventListener(OnlinePresenceService presenceService) {
+        this.presenceService = presenceService;
+    }
+
+    @EventListener
+    public void handleSubscribeEvent(SessionSubscribeEvent event) {
+        StompHeaderAccessor accessor = StompHeaderAccessor.wrap(event.getMessage());
+        String destination = accessor.getDestination();
+        if ("/topic/online-users".equals(destination)) {
+            presenceService.sendInitialListToSession(accessor.getUser(), accessor.getSessionId());
+        }
+    }
+}
+
+// =========================
+// MessageController – /online-users via cache (no DB hit)
+// =========================
+package com.example.chat.api;
+
+import com.example.chat.ws.presence.OnlinePresenceService;
+import com.example.chat.ws.presence.UserDTO;
+import com.example.chat.security.JwtProvider;
+import com.example.chat.user.User;
+import com.example.chat.user.UserRepository;
+import com.example.chat.message.*;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.beans.factory.annotation.Autowired;
+
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/messages")
+@CrossOrigin(origins = "http://localhost:5173", allowCredentials = "true")
+public class MessageController {
+
+    @Autowired private MessageService messageService;
+    @Autowired private UserRepository userRepo;
+    @Autowired private OnlinePresenceService presenceService;
+    @Autowired private JwtProvider jwtProvider;
+
+    private User getUserFromToken(String authHeader) {
+        if (authHeader != null && authHeader.startsWith("Bearer ")) {
+            String token = authHeader.substring(7);
+            String email = jwtProvider.getEmailFromToken(token);
+            return userRepo.findByEmail(email).orElse(null);
+        }
+        return null;
+    }
+
+    @GetMapping("/online-users")
+    public ResponseEntity<?> getOnlineUsers() {
+        List<UserDTO> online = presenceService.getOnlineUsers();
+        return ResponseEntity.ok(online);
+    }
+
+    // ... keep your other endpoints as-is
+}
+
+// =========================
+// MessageServiceImpl – (optional) add pagination & indexes in Repo queries
+// =========================
+package com.example.chat.message;
+
+import com.example.chat.user.User;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+@Service
+public class MessageServiceImpl implements MessageService {
+
+    @Autowired private MessageRepository messageRepo;
+    @Autowired private UserRepository userRepo;
+    @Autowired private SimpMessagingTemplate messagingTemplate;
+
+    @Override
+    public List<User> getUsersForSidebar(User currentUser) {
+        List<User> users = userRepo.findByIdNot(currentUser.getId());
+        users.forEach(u -> u.setPassword(null));
+        return users;
+    }
+
+    @Override
+    public List<ChatMessage> getMessagesBetweenUsers(Long userId1, Long userId2) {
+        // Ideally: repository method returns last N messages ordered by created_at desc
+        return messageRepo.findRecentConversation(userId1, userId2, 50);
+    }
+
+    @Override
+    public List<ChatMessage> getConversation(Long senderId, Long receiverId) {
+        return messageRepo.findRecentConversation(senderId, receiverId, 50);
+    }
+
+    @Override
+    public ChatMessage sendMessage(User sender, Long receiverId, String text, String image) {
+        User receiver = userRepo.findById(receiverId)
+                .orElseThrow(() -> new RuntimeException("Receiver not found"));
+        ChatMessage msg = new ChatMessage(sender, receiver, text, image);
+        ChatMessage saved = messageRepo.save(msg);
+        messagingTemplate.convertAndSendToUser(receiver.getEmail(), "/queue/messages", saved);
+        messagingTemplate.convertAndSendToUser(sender.getEmail(), "/queue/messages", saved);
+        return saved;
+    }
+}
+
+// =========================
+// MessageRepository additions (example)
+// =========================
+package com.example.chat.message;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import java.util.List;
+
+public interface MessageRepository extends JpaRepository<ChatMessage, Long> {
+
+    @Query(value = """
+            SELECT * FROM chat_message m
+            WHERE (m.sender_id = :u1 AND m.receiver_id = :u2)
+               OR (m.sender_id = :u2 AND m.receiver_id = :u1)
+            ORDER BY m.created_at DESC
+            LIMIT :limit
+            """, nativeQuery = true)
+    List<ChatMessage> findRecentConversation(@Param("u1") Long u1,
+                                             @Param("u2") Long u2,
+                                             @Param("limit") int limit);
+}
+
+// =========================
+// SQL indexes (run once)
+// =========================
+/*
+CREATE INDEX idx_msg_pair_time ON messages (sender_id, receiver_id, created_at DESC);
+CREATE INDEX idx_msg_pair_time_rev ON messages (receiver_id, sender_id, created_at DESC);
+*/
