@@ -20,9 +20,8 @@ const ChatContainer = () => {
   const messageEndRef = useRef(null);
 
   const [searchTerm, setSearchTerm] = useState("");
-  const [profilePicModal, setProfilePicModal] = useState(null); // stores clicked profile data
+  const [profilePicModal, setProfilePicModal] = useState(null); 
 
-  // fetch messages on selection
   useEffect(() => {
     if (!selectedUser?.id) return;
 
@@ -69,8 +68,7 @@ const ChatContainer = () => {
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {filteredMessages.map((message, index) => {
-          const isSender = Number(message.sender?.id) === Number(authUser.id);
-
+         const isSender = Number(message.senderId) === Number(authUser.id);
           const prevMessage = filteredMessages[index - 1];
           const prevDate = prevMessage ? formatDate(prevMessage.createdAt) : null;
           const currentDate = formatDate(message.createdAt);

@@ -1,11 +1,12 @@
 import SockJS from "sockjs-client";
-import { Stomp } from "@stomp/stompjs";
+import { Client } from "@stomp/stompjs";
 import { useChatStore } from "./useChatStore";
 
 let stompClient = null;
 
 export function connectSocket() {
-  if (stompClient && stompClient.active) return;
+  // Prevent duplicate clients
+  if (stompClient?.active) return;
 
   const token = localStorage.getItem("token");
   if (!token) {
@@ -13,42 +14,63 @@ export function connectSocket() {
     return;
   }
 
-  const socketFactory = () =>
-    new SockJS(`http://localhost:8080/ws?token=${encodeURIComponent(token)}`);
+  stompClient = new Client({
+    webSocketFactory: () =>
+      new SockJS(
+        `http://localhost:8080/ws?token=${encodeURIComponent(token)}`
+      ),
 
-  stompClient = Stomp.over(socketFactory);
-  stompClient.debug = () => {}; // silence debug logs
+    connectHeaders: {
+      Authorization: `Bearer ${token}`,
+    },
 
-  stompClient.connect({ Authorization: `Bearer ${token}` }, () => {
+    reconnectDelay: 5000,
+    debug: () => {},
+  });
+
+  stompClient.onConnect = () => {
     console.log("✅ WebSocket connected");
 
     const store = useChatStore.getState();
-    store.setStompClient(stompClient);
 
-    // Broadcast updates for all online users
+    // 🔥 always reset state on reconnect
+    store.setStompClient(stompClient);
+    store.unsubscribeFromMessages();
+
+    // 🔹 online users
     stompClient.subscribe("/topic/online-users", (msg) => {
-      const payload = JSON.parse(msg.body);
-      store.setOnlineUsers(payload);
+      store.setOnlineUsers(JSON.parse(msg.body));
     });
 
-    // Subscribe to chat messages
+    // 🔹 personal messages (ALWAYS resubscribe)
     store.subscribeToMessages();
-  }, (err) => {
+  };
+
+  stompClient.onStompError = (frame) => {
+    console.error("❌ STOMP error:", frame.headers["message"]);
+  };
+
+  stompClient.onWebSocketError = (err) => {
     console.error("❌ WebSocket connection error:", err);
-    setTimeout(connectSocket, 5000); // reconnect
-  });
+  };
+
+  stompClient.activate();
 }
 
 export function disconnectSocket() {
   if (stompClient) {
-    if (stompClient.active) stompClient.deactivate();
+    stompClient.deactivate();
     stompClient = null;
-    useChatStore.getState().setStompClient(null);
+
+    const store = useChatStore.getState();
+    store.unsubscribeFromMessages();
+    store.setStompClient(null);
+
     console.log("🔌 WebSocket disconnected");
   }
 }
 
 export function isSocketConnected() {
-  return !!stompClient?.active;
+  return !!stompClient?.connected;
 }
 
